@@ -1,18 +1,31 @@
 import csv
-import io
+import os
 from datetime import datetime
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
 
-import streamlit as st
-
-st.set_page_config(page_title="Face Swap QA Checklist", layout="wide")
 
 APP_TITLE = "Face Swap QA — One-Page Checklist (Auto PASS/FAIL)"
-st.title(APP_TITLE)
+DEFAULT_LOG_NAME = "faceswap_qa_log.csv"
 
-# -----------------------------
-# Core evaluation logic (priority order)
-# -----------------------------
-def evaluate(checks: dict) -> tuple[str, str]:
+
+FAIL_REASONS = [
+    "missing required image(s)",
+    "source identity not clear enough",
+    "target expression/pose not verifiable",
+    "identity not preserved",
+    "expression mismatch (Target → Output)",
+    "head pose mismatch (Target → Output)",
+    "mouth position mismatch (Target → Output)",
+    "visible artifacts / unrealistic blending",
+    "gender/body inconsistency",
+    "skin tone/lighting inconsistency",
+    "unnatural hair blending",
+    "anatomical artifact / logical inconsistency",
+]
+
+
+def evaluate(checks: dict):
     # A) Input completeness
     if not (checks["a_source_provided"] and checks["a_target_provided"] and checks["a_output_provided"]):
         return "FAIL", "missing required image(s)"
@@ -29,7 +42,7 @@ def evaluate(checks: dict) -> tuple[str, str]:
     if not checks["d_output_identity_preserved"] or not checks["d_output_features_match"]:
         return "FAIL", "identity not preserved"
 
-    # E) Target match (critical)
+    # E) Target match (critical, most specific)
     if not checks["e_expression_match"]:
         return "FAIL", "expression mismatch (Target → Output)"
     if not checks["e_pose_match"]:
@@ -62,7 +75,8 @@ def evaluate(checks: dict) -> tuple[str, str]:
 
     return "PASS", ""
 
-def verdict_line(result: str, primary_reason: str, notes: str) -> str:
+
+def verdict_line(result: str, primary_reason: str, notes: str):
     if result == "PASS":
         return "PASS — natural blend, Source identity preserved, Target expression/pose/mouth matched."
     base = f"FAIL — Primary: {primary_reason}."
@@ -71,193 +85,386 @@ def verdict_line(result: str, primary_reason: str, notes: str) -> str:
         base += f" Notes: {notes}"
     return base
 
-# -----------------------------
-# Session state
-# -----------------------------
-if "log_rows" not in st.session_state:
-    st.session_state.log_rows = []
 
-# Defaults: speed-first (most boxes True), inputs False
-DEFAULTS = {
-    "a_source_provided": False,
-    "a_target_provided": False,
-    "a_output_provided": False,
+class ScrollableFrame(ttk.Frame):
+    def __init__(self, container, *args, **kwargs):
+        super().__init__(container, *args, **kwargs)
 
-    "b_source_face_clear": True,
-    "b_source_no_distortions": True,
+        canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        self.scrollable_frame = ttk.Frame(canvas)
 
-    "c_target_expression_readable": True,
-    "c_target_pose_readable": True,
-    "c_target_mouth_readable": True,
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
 
-    "d_output_identity_preserved": True,
-    "d_output_features_match": True,
+        self._window = canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
 
-    "e_expression_match": True,
-    "e_pose_match": True,
-    "e_mouth_match": True,
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
 
-    "f_no_cutout_edges": True,
-    "f_no_warping": True,
-    "f_no_double_features": True,
-    "f_sharpness_consistent": True,
-    "f_lighting_consistent": True,
+        # Improve resize behavior
+        def _on_canvas_configure(event):
+            canvas.itemconfig(self._window, width=event.width)
 
-    "g_no_gender_body_mismatch": True,
-    "g_skin_tone_matches": True,
-    "g_no_weird_tint": True,
-    "g_hairline_natural": True,
-    "g_no_hair_overlap_weirdness": True,
+        canvas.bind("<Configure>", _on_canvas_configure)
 
-    "h_no_disfigured_limbs": True,
-    "h_no_extra_missing_limbs": True,
-    "h_no_background_glitch": True,
-}
+        # Mousewheel support
+        def _on_mousewheel(event):
+            # Windows / Mac
+            delta = event.delta
+            if delta == 0:
+                return
+            canvas.yview_scroll(int(-1 * (delta / 120)), "units")
 
-def ensure_defaults():
-    for k, v in DEFAULTS.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
-ensure_defaults()
 
-# -----------------------------
-# Top metadata
-# -----------------------------
-m1, m2, m3 = st.columns([1, 1, 2])
-with m1:
-    job_id = st.text_input("Job / Asset ID", placeholder="e.g., FS_2025_12_11_001")
-with m2:
-    reviewer = st.text_input("Reviewer", placeholder="e.g., Liman")
-with m3:
-    notes = st.text_input("Notes (1–2 lines)", placeholder="Concrete issue notes (if FAIL).")
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(APP_TITLE)
+        self.geometry("980x820")
+        self.minsize(900, 700)
 
-st.divider()
+        self.log_path = os.path.abspath(DEFAULT_LOG_NAME)
 
-# -----------------------------
-# Buttons
-# -----------------------------
-b1, b2, b3 = st.columns([1, 1, 3])
-with b1:
-    if st.button("Mark All OK"):
-        for k in DEFAULTS:
+        self.vars = {}
+        self._build_vars()
+        self._build_ui()
+        self._wire_traces()
+        self.update_result()
+
+    def _build_vars(self):
+        # Metadata
+        self.job_id_var = tk.StringVar(value="")
+        self.reviewer_var = tk.StringVar(value="")
+        self.notes_var = tk.StringVar(value="")
+
+        # Checklist (BooleanVars)
+        def bv(default=False):
+            return tk.BooleanVar(value=default)
+
+        # Start with everything "OK" = True for speed, but inputs off by default.
+        self.vars = {
+            # A) Inputs
+            "a_source_provided": bv(False),
+            "a_target_provided": bv(False),
+            "a_output_provided": bv(False),
+
+            # B) Source sanity
+            "b_source_face_clear": bv(True),
+            "b_source_no_distortions": bv(True),
+
+            # C) Target anchor
+            "c_target_expression_readable": bv(True),
+            "c_target_pose_readable": bv(True),
+            "c_target_mouth_readable": bv(True),
+
+            # D) Identity
+            "d_output_identity_preserved": bv(True),
+            "d_output_features_match": bv(True),
+
+            # E) Target match
+            "e_expression_match": bv(True),
+            "e_pose_match": bv(True),
+            "e_mouth_match": bv(True),
+
+            # F) Photorealism
+            "f_no_cutout_edges": bv(True),
+            "f_no_warping": bv(True),
+            "f_no_double_features": bv(True),
+            "f_sharpness_consistent": bv(True),
+            "f_lighting_consistent": bv(True),
+
+            # G) Consistency
+            "g_no_gender_body_mismatch": bv(True),
+            "g_skin_tone_matches": bv(True),
+            "g_no_weird_tint": bv(True),
+            "g_hairline_natural": bv(True),
+            "g_no_hair_overlap_weirdness": bv(True),
+
+            # H) Anatomy
+            "h_no_disfigured_limbs": bv(True),
+            "h_no_extra_missing_limbs": bv(True),
+            "h_no_background_glitch": bv(True),
+        }
+
+    def _wire_traces(self):
+        for k, v in self.vars.items():
+            v.trace_add("write", lambda *_: self.update_result())
+        self.notes_var.trace_add("write", lambda *_: self.update_result())
+
+    def _build_ui(self):
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+
+        # Top bar
+        top = ttk.Frame(self, padding=10)
+        top.pack(fill="x")
+
+        ttk.Label(top, text=APP_TITLE, font=("Segoe UI", 14, "bold")).pack(side="left")
+
+        ttk.Button(top, text="Export CSV", command=self.export_csv).pack(side="right", padx=(8, 0))
+        ttk.Button(top, text="Save Row", command=self.save_row).pack(side="right", padx=(8, 0))
+        ttk.Button(top, text="Copy Verdict", command=self.copy_verdict).pack(side="right")
+
+        # Metadata
+        meta = ttk.LabelFrame(self, text="Review Details", padding=10)
+        meta.pack(fill="x", padx=10, pady=(0, 10))
+
+        row1 = ttk.Frame(meta)
+        row1.pack(fill="x")
+
+        ttk.Label(row1, text="Job / Asset ID:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(row1, textvariable=self.job_id_var, width=28).grid(row=0, column=1, sticky="w", padx=(6, 18))
+
+        ttk.Label(row1, text="Reviewer:").grid(row=0, column=2, sticky="w")
+        ttk.Entry(row1, textvariable=self.reviewer_var, width=22).grid(row=0, column=3, sticky="w", padx=(6, 18))
+
+        ttk.Label(row1, text="Log file:").grid(row=0, column=4, sticky="w")
+        self.log_label = ttk.Label(row1, text=self.log_path)
+        self.log_label.grid(row=0, column=5, sticky="w")
+
+        row2 = ttk.Frame(meta)
+        row2.pack(fill="x", pady=(8, 0))
+
+        ttk.Label(row2, text="Notes (1–2 lines):").grid(row=0, column=0, sticky="w")
+        ttk.Entry(row2, textvariable=self.notes_var, width=110).grid(row=0, column=1, sticky="w", padx=(6, 0))
+
+        # Buttons row
+        btns = ttk.Frame(self, padding=(10, 0, 10, 10))
+        btns.pack(fill="x")
+
+        ttk.Button(btns, text="Mark All OK", command=self.mark_all_ok).pack(side="left")
+        ttk.Button(btns, text="Reset All", command=self.reset_all).pack(side="left", padx=(8, 0))
+
+        # Result panel
+        result_box = ttk.LabelFrame(self, text="Result", padding=10)
+        result_box.pack(fill="x", padx=10, pady=(0, 10))
+
+        self.result_big = ttk.Label(result_box, text="—", font=("Segoe UI", 16, "bold"))
+        self.result_big.pack(anchor="w")
+
+        self.reason_label = ttk.Label(result_box, text="", font=("Segoe UI", 11))
+        self.reason_label.pack(anchor="w", pady=(4, 0))
+
+        self.verdict_text = tk.Text(result_box, height=2, wrap="word")
+        self.verdict_text.pack(fill="x", pady=(8, 0))
+        self.verdict_text.configure(state="disabled")
+
+        # Checklist (scrollable)
+        scroll = ScrollableFrame(self)
+        scroll.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        body = scroll.scrollable_frame
+
+        # Build sections
+        self._section_a(body)
+        self._section_b(body)
+        self._section_c(body)
+        self._section_d(body)
+        self._section_e(body)
+        self._section_f(body)
+        self._section_g(body)
+        self._section_h(body)
+
+        # Footer
+        foot = ttk.Frame(self, padding=10)
+        foot.pack(fill="x")
+        ttk.Label(foot, text="Tip: If something is wrong, just untick the relevant box — FAIL reason updates automatically.").pack(anchor="w")
+
+    def _make_section(self, parent, title):
+        lf = ttk.LabelFrame(parent, text=title, padding=10)
+        lf.pack(fill="x", expand=True, pady=6)
+        return lf
+
+    def _check(self, parent, text, key):
+        cb = ttk.Checkbutton(parent, text=text, variable=self.vars[key])
+        cb.pack(anchor="w", pady=2)
+
+    def _section_a(self, parent):
+        lf = self._make_section(parent, "A) Input Completeness")
+        self._check(lf, "Source image provided", "a_source_provided")
+        self._check(lf, "Target image provided", "a_target_provided")
+        self._check(lf, "Output image provided", "a_output_provided")
+
+    def _section_b(self, parent):
+        lf = self._make_section(parent, "B) Source Image Sanity (Source Only)")
+        self._check(lf, "Source face is clearly visible", "b_source_face_clear")
+        self._check(lf, "No obvious distortions in Source that prevent identity reading", "b_source_no_distortions")
+
+    def _section_c(self, parent):
+        lf = self._make_section(parent, "C) Target Anchor (Target Only — Must Preserve)")
+        self._check(lf, "Target expression is clearly readable", "c_target_expression_readable")
+        self._check(lf, "Target head pose is clearly readable", "c_target_pose_readable")
+        self._check(lf, "Target mouth position is clearly readable", "c_target_mouth_readable")
+
+    def _section_d(self, parent):
+        lf = self._make_section(parent, "D) Identity Preservation (Source → Output)")
+        self._check(lf, "Output clearly preserves Source identity", "d_output_identity_preserved")
+        self._check(lf, "Key facial structure/features match Source", "d_output_features_match")
+
+    def _section_e(self, parent):
+        lf = self._make_section(parent, "E) Target Match (Target → Output) ✅ Critical")
+        self._check(lf, "Output expression matches Target", "e_expression_match")
+        self._check(lf, "Output head pose matches Target", "e_pose_match")
+        self._check(lf, "Output mouth position matches Target", "e_mouth_match")
+
+    def _section_f(self, parent):
+        lf = self._make_section(parent, "F) Photorealism & Blend (Output Only)")
+        self._check(lf, "No visible face cutout edges / hard seams", "f_no_cutout_edges")
+        self._check(lf, "No warping around jaw/cheeks/ears/eyes/teeth", "f_no_warping")
+        self._check(lf, "No double-features (ghost teeth, extra eyes, duplicated nose)", "f_no_double_features")
+        self._check(lf, "Face sharpness matches scene (not pasted/over-smoothed)", "f_sharpness_consistent")
+        self._check(lf, "Lighting/shadows consistent with scene", "f_lighting_consistent")
+
+    def _section_g(self, parent):
+        lf = self._make_section(parent, "G) Consistency (Output Logic)")
+        self._check(lf, "No obvious gender/body-type mismatch", "g_no_gender_body_mismatch")
+        self._check(lf, "Face tone matches neck/body", "g_skin_tone_matches")
+        self._check(lf, "No weird tint (gray/green/orange)", "g_no_weird_tint")
+        self._check(lf, "Hairline looks natural", "g_hairline_natural")
+        self._check(lf, "No unnatural hair overlap around temples/forehead", "g_no_hair_overlap_weirdness")
+
+    def _section_h(self, parent):
+        lf = self._make_section(parent, "H) Anatomy & Scene Integrity")
+        self._check(lf, "No disfigured limbs/hands/fingers in Output", "h_no_disfigured_limbs")
+        self._check(lf, "No missing/extra limbs or impossible geometry", "h_no_extra_missing_limbs")
+        self._check(lf, "No background bending/glitching caused by swap", "h_no_background_glitch")
+
+    def get_checks(self):
+        return {k: bool(v.get()) for k, v in self.vars.items()}
+
+    def update_result(self):
+        checks = self.get_checks()
+        result, reason = evaluate(checks)
+
+        # Update labels
+        if result == "PASS":
+            self.result_big.config(text="PASS ✅", foreground="#0a7a0a")
+            self.reason_label.config(text="Primary fail reason: (none)", foreground="#0a7a0a")
+        else:
+            self.result_big.config(text="FAIL ❌", foreground="#b00020")
+            self.reason_label.config(text=f"Primary fail reason: {reason}", foreground="#b00020")
+
+        # Verdict line
+        line = verdict_line(result, reason, self.notes_var.get())
+        self.verdict_text.configure(state="normal")
+        self.verdict_text.delete("1.0", "end")
+        self.verdict_text.insert("1.0", line)
+        self.verdict_text.configure(state="disabled")
+
+    def copy_verdict(self):
+        checks = self.get_checks()
+        result, reason = evaluate(checks)
+        line = verdict_line(result, reason, self.notes_var.get())
+        self.clipboard_clear()
+        self.clipboard_append(line)
+        self.update()  # keeps clipboard on some systems
+        messagebox.showinfo("Copied", "Verdict copied to clipboard.")
+
+    def mark_all_ok(self):
+        # Mark everything except inputs as OK (True). Inputs stay as-is.
+        for k, var in self.vars.items():
             if k.startswith("a_"):
-                continue  # keep input checks manual
-            st.session_state[k] = True
-with b2:
-    if st.button("Reset"):
-        for k, v in DEFAULTS.items():
-            st.session_state[k] = v
-        st.toast("Reset done.", icon="🧹")
+                continue
+            var.set(True)
 
-# -----------------------------
-# Checklist UI
-# -----------------------------
-left, right = st.columns([1, 1])
+    def reset_all(self):
+        if not messagebox.askyesno("Reset", "Reset all checkboxes and fields?"):
+            return
+        self.job_id_var.set("")
+        self.reviewer_var.set("")
+        self.notes_var.set("")
 
-with left:
-    st.subheader("A) Input Completeness")
-    st.checkbox("Source image provided", key="a_source_provided")
-    st.checkbox("Target image provided", key="a_target_provided")
-    st.checkbox("Output image provided", key="a_output_provided")
+        # Inputs false, everything else true (fast default)
+        for k, var in self.vars.items():
+            if k.startswith("a_"):
+                var.set(False)
+            else:
+                var.set(True)
 
-    st.subheader("B) Source Image Sanity (Source Only)")
-    st.checkbox("Source face is clearly visible", key="b_source_face_clear")
-    st.checkbox("No obvious distortions in Source that prevent identity reading", key="b_source_no_distortions")
+    def save_row(self):
+        checks = self.get_checks()
+        result, reason = evaluate(checks)
 
-    st.subheader("C) Target Anchor (Target Only — Must Preserve)")
-    st.checkbox("Target expression is clearly readable", key="c_target_expression_readable")
-    st.checkbox("Target head pose is clearly readable", key="c_target_pose_readable")
-    st.checkbox("Target mouth position is clearly readable", key="c_target_mouth_readable")
-
-    st.subheader("D) Identity Preservation (Source → Output)")
-    st.checkbox("Output clearly preserves Source identity", key="d_output_identity_preserved")
-    st.checkbox("Key facial structure/features match Source", key="d_output_features_match")
-
-with right:
-    st.subheader("E) Target Match (Target → Output) ✅ Critical")
-    st.checkbox("Output expression matches Target", key="e_expression_match")
-    st.checkbox("Output head pose matches Target", key="e_pose_match")
-    st.checkbox("Output mouth position matches Target", key="e_mouth_match")
-
-    st.subheader("F) Photorealism & Blend (Output Only)")
-    st.checkbox("No visible face cutout edges / hard seams", key="f_no_cutout_edges")
-    st.checkbox("No warping around jaw/cheeks/ears/eyes/teeth", key="f_no_warping")
-    st.checkbox("No double-features (ghost teeth, extra eyes, duplicated nose)", key="f_no_double_features")
-    st.checkbox("Face sharpness matches scene (not pasted/over-smoothed)", key="f_sharpness_consistent")
-    st.checkbox("Lighting/shadows consistent with scene", key="f_lighting_consistent")
-
-    st.subheader("G) Consistency (Output Logic)")
-    st.checkbox("No obvious gender/body-type mismatch", key="g_no_gender_body_mismatch")
-    st.checkbox("Face tone matches neck/body", key="g_skin_tone_matches")
-    st.checkbox("No weird tint (gray/green/orange)", key="g_no_weird_tint")
-    st.checkbox("Hairline looks natural", key="g_hairline_natural")
-    st.checkbox("No unnatural hair overlap around temples/forehead", key="g_no_hair_overlap_weirdness")
-
-    st.subheader("H) Anatomy & Scene Integrity")
-    st.checkbox("No disfigured limbs/hands/fingers in Output", key="h_no_disfigured_limbs")
-    st.checkbox("No missing/extra limbs or impossible geometry", key="h_no_extra_missing_limbs")
-    st.checkbox("No background bending/glitching caused by swap", key="h_no_background_glitch")
-
-# -----------------------------
-# Compute result
-# -----------------------------
-checks = {k: bool(st.session_state[k]) for k in DEFAULTS.keys()}
-result, primary_reason = evaluate(checks)
-line = verdict_line(result, primary_reason, notes)
-
-st.divider()
-st.subheader("Result")
-
-if result == "PASS":
-    st.success("PASS ✅")
-    st.write("Primary fail reason: (none)")
-else:
-    st.error("FAIL ❌")
-    st.write(f"Primary fail reason: **{primary_reason}**")
-
-st.code(line)
-
-# -----------------------------
-# Logging (in-memory session log) + CSV download
-# -----------------------------
-c1, c2, c3 = st.columns([1, 1, 2])
-
-with c1:
-    if st.button("Add to Session Log"):
         row = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
-            "job_id": job_id.strip(),
-            "reviewer": reviewer.strip(),
+            "job_id": self.job_id_var.get().strip(),
+            "reviewer": self.reviewer_var.get().strip(),
             "result": result,
-            "primary_fail_reason": primary_reason,
-            "notes": notes.strip(),
+            "primary_fail_reason": reason,
+            "notes": self.notes_var.get().strip(),
         }
+
+        # Include checklist booleans
         for k in sorted(checks.keys()):
             row[k] = checks[k]
-        st.session_state.log_rows.append(row)
-        st.toast("Added to log.", icon="✅")
 
-with c2:
-    if st.button("Clear Session Log"):
-        st.session_state.log_rows = []
-        st.toast("Cleared.", icon="🗑️")
+        # Ensure folder exists
+        try:
+            self._append_csv(self.log_path, row)
+            messagebox.showinfo("Saved", f"Saved row to:\n{self.log_path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not save CSV:\n{e}")
 
-with c3:
-    if st.session_state.log_rows:
-        # Build CSV
-        headers = list(st.session_state.log_rows[0].keys())
-        output = io.StringIO()
-        writer = csv.DictWriter(output, fieldnames=headers)
-        writer.writeheader()
-        for r in st.session_state.log_rows:
-            writer.writerow(r)
-
-        st.download_button(
-            "Download CSV (Session Log)",
-            data=output.getvalue().encode("utf-8"),
-            file_name="faceswap_qa_session_log.csv",
-            mime="text/csv",
+    def export_csv(self):
+        path = filedialog.asksaveasfilename(
+            title="Export CSV Log As...",
+            defaultextension=".csv",
+            initialfile=os.path.basename(self.log_path),
+            filetypes=[("CSV files", "*.csv")],
         )
-    else:
-        st.caption("No session log rows yet. Click “Add to Session Log” after a review.")
+        if not path:
+            return
+
+        # If current log exists, copy it; otherwise create a blank with headers.
+        try:
+            if os.path.exists(self.log_path):
+                with open(self.log_path, "rb") as src, open(path, "wb") as dst:
+                    dst.write(src.read())
+            else:
+                # Create with headers
+                checks = self.get_checks()
+                headers = ["timestamp", "job_id", "reviewer", "result", "primary_fail_reason", "notes"] + sorted(checks.keys())
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=headers)
+                    writer.writeheader()
+            messagebox.showinfo("Exported", f"Exported CSV to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not export CSV:\n{e}")
+
+    @staticmethod
+    def _append_csv(path, row: dict):
+        file_exists = os.path.exists(path)
+
+        # Determine headers
+        headers = list(row.keys())
+
+        # If file exists, keep its header order if possible
+        if file_exists:
+            try:
+                with open(path, "r", newline="", encoding="utf-8") as f:
+                    reader = csv.reader(f)
+                    existing_headers = next(reader, None)
+                if existing_headers and set(existing_headers) == set(headers):
+                    headers = existing_headers
+            except Exception:
+                # fall back to current headers
+                pass
+
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
